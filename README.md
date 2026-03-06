@@ -1,8 +1,7 @@
 <div align="center">
 
-# BigBanFan 🔥
+<img src="assets/banner.png" alt="BigBanFan" width="420" />
 
-**Ban once. Protected everywhere.**
 
 *Distributed real-time IP threat response for Linux server clusters*
 
