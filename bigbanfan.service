@@ -1,0 +1,27 @@
+[Unit]
+Description=BigBanFan Distributed IP Ban Manager
+Documentation=https://github.com/yourorg/bigbanfan
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+ExecStart=/usr/local/bin/bigbanfan -config /etc/bigbanfan/config.yaml
+
+# Restart on failure; wait 5s before retry.
+Restart=always
+RestartSec=5
+
+# Allow high file descriptor count for many peer connections.
+LimitNOFILE=65536
+
+# Write stdout/stderr to journald (in addition to the log file).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bigbanfan
+
+[Install]
+WantedBy=multi-user.target

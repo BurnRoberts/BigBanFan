@@ -1,0 +1,79 @@
+# ──────────────────────────────────────────────────────────────
+# BigBanFan — Example Configuration
+# Copy to /etc/bigbanfan/config.yaml and edit before starting.
+# ──────────────────────────────────────────────────────────────
+
+# Unique stable identifier for this node on the network.
+# MUST be unique across all nodes. Used for loop-prevention routing:
+# every BAN message carries the originating node_id so relay nodes
+# never echo the message back to its source.
+node_id: cdn12
+
+# Static list of peer nodes to connect to (host:port).
+# You list only directly-connected neighbours here.
+# Each node should list its neighbours; BigBanFan does the rest.
+peers:
+  - cdn13.nexysync.com:7777
+  # - cdn14.nexysync.com:7777
+  # - cdn12.nexysync.com:7777
+
+# Maximum number of simultaneous outbound peer connections.
+max_peers: 8
+
+# TCP port for inter-node (node-to-node) TLS connections.
+listen_port: 7777
+
+# TCP port for external clients (Python / PHP scripts).
+# Uses a SEPARATE key (client_key) from the inter-node key.
+client_port: 7778
+
+# Unix domain socket for local root-only IP injection.
+# Usage: echo "1.2.3.4" | nc -U /run/bigbanfan.sock
+unix_socket: /run/bigbanfan.sock
+
+# ── Security Keys ─────────────────────────────────────────────
+# Generate with: make gen-keys
+# These must be identical across all nodes for node_key.
+# client_key only needs to match on the client scripts you deploy.
+
+# 32-byte (64 hex chars) AES-256 key for inter-node frame encryption+HMAC.
+# ALL nodes in the cluster must use the SAME node_key.
+node_key: "REPLACE_WITH_64_HEX_CHARS_FROM_make_gen-keys"
+
+# 32-byte (64 hex chars) AES-256 key for Python/PHP client injection.
+# Must match the key passed to bigbanfan_client.py / bigbanfan_client.php.
+client_key: "REPLACE_WITH_DIFFERENT_64_HEX_CHARS"
+
+# ── TLS ───────────────────────────────────────────────────────
+# Generate self-signed certs with: make gen-certs
+tls_cert: /etc/bigbanfan/node.crt
+tls_key: /etc/bigbanfan/node.key
+
+# ── Storage ───────────────────────────────────────────────────
+# SQLite database path (created automatically).
+db_path: /var/lib/bigbanfan/bans.db
+
+# ── Logging ───────────────────────────────────────────────────
+log_file: /var/log/bigbanfan.log
+log_level: info # info | warn | error
+
+# ── Ban Policy ────────────────────────────────────────────────
+# How many hours an IP stays banned before automatic removal.
+ban_duration_hours: 24
+
+# ── Ignore Ranges ─────────────────────────────────────────────
+# CIDR ranges that will NEVER be banned, regardless of source.
+# Applies to: Unix socket, TCP client scripts, AND peer-propagated bans.
+# Any IP falling in one of these ranges is silently dropped with a log entry.
+# Supports both IPv4 and IPv6 CIDRs.
+#
+# Typical entries:
+#   - Your own node IP ranges (prevent nodes from banning each other)
+#   - Management / control plane subnets
+#   - Kubernetes pod and service subnets
+#   - Localhost / loopback ranges
+ignore_ranges:
+  - "127.0.0.0/8" # IPv4 loopback
+  - "::1/128" # IPv6 loopback
+  # - "192.168.0.0/16"     # Kubernetes pod subnet
+  # - "10.96.0.0/16"       # Kubernetes service subnet

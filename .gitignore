@@ -1,0 +1,43 @@
+# ── Build output ──────────────────────────────────────────────
+bin/
+*.exe
+
+# ── Runtime / production config (contains secrets) ────────────
+# Copy config.example.yaml → config.yaml and fill in your values.
+config.yaml
+
+# ── Database ───────────────────────────────────────────────────
+*.db
+*.db-shm
+*.db-wal
+
+# ── Logs ───────────────────────────────────────────────────────
+*.log
+
+# ── Python ─────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# ── TLS certs (generated locally, not committed) ───────────────
+*.crt
+*.key
+*.pem
+
+# ── NexySync agent key ─────────────────────────────────────────
+.nexysync/
+
+# ── OS / editor noise ─────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# ── Agent tooling (not part of the public project) ────────────
+.agent/
+deprecated/
+MARKETING.md
+reload.sh

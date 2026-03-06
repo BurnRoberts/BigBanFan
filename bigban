@@ -1,0 +1,41 @@
+#!/bin/bash
+# bigban — Ban or unban an IP across the BigBanFan cluster.
+#
+# Usage:
+#   bigban <ip>          # ban
+#   bigban -u <ip>       # unban
+#   bigban --unban <ip>  # unban
+
+HOST="your-node.example.com"       # ← BigBanFan node hostname or IP
+PORT="7778"                        # ← client_port from config.yaml
+KEY="YOUR_CLIENT_KEY_HEX_HERE"    # ← client_key from config.yaml (64 hex chars)
+SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+
+# normalize_ip strips IPv4-mapped IPv6 prefixes and trailing port numbers.
+#   ::ffff:52.167.144.146:60884  →  52.167.144.146
+#   ::ffff:136.109.111.213       →  136.109.111.213
+#   2001:db8::1                  →  2001:db8::1  (untouched — real IPv6)
+normalize_ip() {
+    local ip="$1"
+    # Strip ::ffff: prefix (IPv4-mapped IPv6).
+    [[ "$ip" == ::ffff:* ]] && ip="${ip#::ffff:}"
+    # Strip trailing :port ONLY if what remains looks like IPv4:port
+    # (exactly 3 dots and one colon — prevents mangling real IPv6 addrs).
+    if [[ "$ip" =~ ^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):[0-9]+$ ]]; then
+        ip="${BASH_REMATCH[1]}"
+    fi
+    echo "$ip"
+}
+
+if [[ "$1" == "-u" || "$1" == "--unban" ]]; then
+    shift
+    [[ -z "$1" ]] && { echo "Usage: bigban -u <ip>"; exit 1; }
+    IP="$(normalize_ip "$1")"
+    echo "UNBAN: $IP"
+    python3 "$SCRIPT_DIR/scripts/bigbanfan_client.py" "$HOST" "$PORT" "$KEY" --unban "$IP"
+else
+    [[ -z "$1" ]] && { echo "Usage: bigban <ip>  |  bigban -u <ip>"; exit 1; }
+    IP="$(normalize_ip "$1")"
+    echo "BAN: $IP"
+    python3 "$SCRIPT_DIR/scripts/bigbanfan_client.py" "$HOST" "$PORT" "$KEY" "$IP"
+fi
