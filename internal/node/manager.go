@@ -13,10 +13,17 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// MgmtSession is implemented by mgmt.Session. The manager calls Push on all
+// registered sessions when ban/unban/peer events occur.
+type MgmtSession interface {
+	Push(msg *proto.Message)
+}
 
 // Manager owns the peer pool, the node server, and the ban pipeline.
 // It is the central coordinator for all inter-node communication.
@@ -26,12 +33,24 @@ type Manager struct {
 	db        *db.DB
 	dedupeSet *dedupe.Set
 	detector  *scandetect.Detector // nil if scan detection is disabled
+	startTime time.Time
+	version   string
 
 	mu    sync.RWMutex
 	peers map[string]*Peer // keyed by peer.remoteAddr (host:port)
 
+	// Management sessions registry — push events to all connected GUI clients.
+	mgmtMu   sync.RWMutex
+	mgmtSess map[MgmtSession]struct{}
+
 	banCh   chan banEvent   // internal: trigger a ban pipeline
 	unbanCh chan unbanEvent // internal: trigger an unban pipeline
+
+	// Session stats (atomic, zeroed on restart — not persisted).
+	statBans        atomic.Int64
+	statUnbans      atomic.Int64
+	statScanDetects atomic.Int64
+	statConnsIn     atomic.Int64
 }
 
 type banEvent struct {
@@ -46,13 +65,16 @@ type unbanEvent struct {
 }
 
 // NewManager creates a Manager.
-func NewManager(cfg *config.Config, nodeKey []byte, database *db.DB, ds *dedupe.Set) *Manager {
+func NewManager(cfg *config.Config, nodeKey []byte, database *db.DB, ds *dedupe.Set, version string) *Manager {
 	return &Manager{
 		cfg:       cfg,
 		nodeKey:   nodeKey,
 		db:        database,
 		dedupeSet: ds,
+		version:   version,
+		startTime: time.Now(),
 		peers:     make(map[string]*Peer),
+		mgmtSess:  make(map[MgmtSession]struct{}),
 		banCh:     make(chan banEvent, 256),
 		unbanCh:   make(chan unbanEvent, 256),
 	}
@@ -81,6 +103,79 @@ func (m *Manager) SubmitBan(ip string) {
 	dedupeID := uuid.New().String()
 	m.banCh <- banEvent{ip: ip, dedupeID: dedupeID, originNode: m.cfg.NodeID}
 }
+
+// RegisterMgmtSession registers a management GUI session to receive push events.
+func (m *Manager) RegisterMgmtSession(s MgmtSession) {
+	m.mgmtMu.Lock()
+	m.mgmtSess[s] = struct{}{}
+	m.mgmtMu.Unlock()
+}
+
+// UnregisterMgmtSession removes a management session (called on disconnect).
+func (m *Manager) UnregisterMgmtSession(s MgmtSession) {
+	m.mgmtMu.Lock()
+	delete(m.mgmtSess, s)
+	m.mgmtMu.Unlock()
+}
+
+// pushToMgmt broadcasts a message to all connected management sessions.
+func (m *Manager) pushToMgmt(msg *proto.Message) {
+	m.mgmtMu.RLock()
+	defer m.mgmtMu.RUnlock()
+	for s := range m.mgmtSess {
+		s.Push(msg)
+	}
+}
+
+// GetPeers returns a snapshot of all known peers and their connection state.
+func (m *Manager) GetPeers() []proto.PeerRecord {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var records []proto.PeerRecord
+	for _, p := range m.peers {
+		records = append(records, proto.PeerRecord{
+			NodeID:    p.RemoteNodeID(),
+			Addr:      p.remoteAddr,
+			Connected: p.IsConnected(),
+			LastSeen:  p.LastSeen().Unix(),
+			Direction: p.Direction(),
+		})
+	}
+	return records
+}
+
+// GetStats returns a snapshot of session-only counters.
+func (m *Manager) GetStats() proto.StatsInfo {
+	return proto.StatsInfo{
+		BansThisSession:        m.statBans.Load(),
+		UnbansThisSession:      m.statUnbans.Load(),
+		ScanDetectsThisSession: m.statScanDetects.Load(),
+		ConnectionsAccepted:    m.statConnsIn.Load(),
+	}
+}
+
+// GetStatus returns a status summary for this node.
+func (m *Manager) GetStatus() (*proto.StatusInfo, error) {
+	m.mu.RLock()
+	peerCount := len(m.peers)
+	m.mu.RUnlock()
+
+	banCount := 0
+	if n, err := m.db.CountBans("", "", true); err == nil {
+		banCount = n
+	}
+
+	return &proto.StatusInfo{
+		NodeID:    m.cfg.NodeID,
+		Version:   m.version,
+		UptimeSec: int64(time.Since(m.startTime).Seconds()),
+		PeerCount: peerCount,
+		BanCount:  banCount,
+	}, nil
+}
+
+// IncrScanDetect is called by the scanner detector to increment the session counter.
+func (m *Manager) IncrScanDetect() { m.statScanDetects.Add(1) }
 
 // banPipeline processes ban events: applies locally if new, then notifies peers.
 func (m *Manager) banPipeline() {
@@ -124,6 +219,7 @@ func (m *Manager) banPipeline() {
 		} else {
 			logger.Info("BANNED %s (dedupe=%s origin=%s ttl=%.0fh)", ev.ip, ev.dedupeID, ev.originNode, m.cfg.BanDurationHours)
 		}
+		m.statBans.Add(1)
 
 		// Broadcast BAN to all peers EXCEPT the origin node.
 		msg := &proto.Message{
@@ -134,6 +230,15 @@ func (m *Manager) banPipeline() {
 			Ts:       now.Unix(),
 		}
 		m.broadcast(msg, ev.originNode)
+
+		// Push BAN_EVENT to all management sessions.
+		m.pushToMgmt(&proto.Message{
+			Type:     proto.MsgBanEvent,
+			NodeID:   m.cfg.NodeID,
+			IP:       ev.ip,
+			DedupeID: ev.dedupeID,
+			Ts:       now.Unix(),
+		})
 	}
 }
 
@@ -154,6 +259,7 @@ func (m *Manager) unbanPipeline() {
 			// Not fatal — rule may not exist if ban already expired.
 			logger.Warn("iptables remove %s: %v", ev.ip, err)
 		}
+		m.statUnbans.Add(1)
 
 		msg := &proto.Message{
 			Type:   proto.MsgUnban,
@@ -162,6 +268,14 @@ func (m *Manager) unbanPipeline() {
 			Ts:     time.Now().Unix(),
 		}
 		m.broadcast(msg, ev.originNode)
+
+		// Push UNBAN_EVENT to all management sessions.
+		m.pushToMgmt(&proto.Message{
+			Type:   proto.MsgUnbanEvent,
+			NodeID: m.cfg.NodeID,
+			IP:     ev.ip,
+			Ts:     time.Now().Unix(),
+		})
 	}
 }
 
@@ -220,19 +334,31 @@ func (m *Manager) broadcast(msg *proto.Message, excludeNodeID string) {
 	}
 }
 
-// RegisterPeer adds a peer to the pool.
+// RegisterPeer adds a peer to the pool and pushes PEER_UP to management sessions.
 func (m *Manager) RegisterPeer(p *Peer) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.peers[p.remoteAddr] = p
+	m.mu.Unlock()
 	logger.Info("peer registered: %s (node=%s)", p.remoteAddr, p.RemoteNodeID())
+	m.pushToMgmt(&proto.Message{
+		Type:   proto.MsgPeerUp,
+		NodeID: p.RemoteNodeID(),
+		IP:     p.remoteAddr,
+		Ts:     time.Now().Unix(),
+	})
 }
 
-// UnregisterPeer removes a peer from the pool.
+// UnregisterPeer removes a peer and pushes PEER_DOWN to management sessions.
 func (m *Manager) UnregisterPeer(p *Peer) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	delete(m.peers, p.remoteAddr)
+	m.mu.Unlock()
+	m.pushToMgmt(&proto.Message{
+		Type:   proto.MsgPeerDown,
+		NodeID: p.RemoteNodeID(),
+		IP:     p.remoteAddr,
+		Ts:     time.Now().Unix(),
+	})
 }
 
 // StartServer begins accepting inbound TLS connections from peer nodes.
@@ -261,6 +387,7 @@ func (m *Manager) StartServer(tlsCert, tlsKey string) error {
 				logger.Error("node server accept: %v", err)
 				continue
 			}
+			m.statConnsIn.Add(1)
 			go m.serveInbound(conn)
 		}
 	}()

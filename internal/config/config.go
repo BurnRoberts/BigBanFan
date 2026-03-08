@@ -27,6 +27,11 @@ type Config struct {
 	// ClientPort is the TCP port for external client injection (Python/PHP scripts).
 	ClientPort int `yaml:"client_port"`
 
+	// MgmtPort is the TCP port for the persistent management connection (GUI / monitoring).
+	// Uses the same AES-256-GCM frame protocol as client_port but keeps connections
+	// alive and supports bidirectional request/response + push events.
+	MgmtPort int `yaml:"mgmt_port"`
+
 	// UnixSocket is the path to the Unix domain socket for local IP injection.
 	UnixSocket string `yaml:"unix_socket"`
 
@@ -81,6 +86,7 @@ func DefaultConfig() *Config {
 		MaxPeers:             8,
 		ListenPort:           7777,
 		ClientPort:           7778,
+		MgmtPort:             7779,
 		UnixSocket:           "/run/bigbanfan.sock",
 		DBPath:               "/var/lib/bigbanfan/bans.db",
 		LogFile:              "/var/log/bigbanfan.log",

@@ -27,6 +27,11 @@ listen_port: 7777
 # Uses a SEPARATE key (client_key) from the inter-node key.
 client_port: 7778
 
+# TCP port for the management GUI (bigbanfan-gui) and monitoring tools.
+# Uses the same client_key as client_port for auth.
+# Persistent bidirectional connections: supports request/response + push events.
+mgmt_port: 7779
+
 # Unix domain socket for local root-only IP injection.
 # Usage: echo "1.2.3.4" | nc -U /run/bigbanfan.sock
 unix_socket: /run/bigbanfan.sock

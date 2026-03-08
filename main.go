@@ -8,6 +8,7 @@ import (
 	"bigbanfan/internal/dedupe"
 	"bigbanfan/internal/ipt"
 	"bigbanfan/internal/logger"
+	"bigbanfan/internal/mgmt"
 	"bigbanfan/internal/node"
 	"bigbanfan/internal/scandetect"
 	"flag"
@@ -118,7 +119,7 @@ func main() {
 	}
 
 	// ── Node Manager ──────────────────────────────────────────────────────────
-	mgr := node.NewManager(cfg, nodeKey, database, ds)
+	mgr := node.NewManager(cfg, nodeKey, database, ds, version)
 
 	// ── Scan Detection ────────────────────────────────────────────────────────
 	if cfg.ScanDetectEnabled {
@@ -160,6 +161,14 @@ func main() {
 		logger.Error("client tcp: %v", err)
 		os.Exit(1)
 	}
+
+	// ── Management Port ───────────────────────────────────────────────────────
+	mgmtServer := mgmt.New(mgr, database, clientKey)
+	if err := mgmtServer.Serve(cfg.MgmtPort); err != nil {
+		logger.Error("mgmt port: %v", err)
+		os.Exit(1)
+	}
+	logger.Info("mgmt port: listening on :%d (client_key auth, persistent connections)", cfg.MgmtPort)
 
 	// ── Expiry Ticker ─────────────────────────────────────────────────────────
 	ticker := time.NewTicker(60 * time.Second)

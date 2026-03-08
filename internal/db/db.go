@@ -128,6 +128,83 @@ func (d *DB) RemoveBan(ip string) error {
 	return err
 }
 
+// SearchBans returns a paginated, filtered slice of bans for management clients.
+//
+// Parameters:
+//   - search: if non-empty, filter rows where ip LIKE '%search%' (IPv4, IPv6, CIDR strings all match)
+//   - filterSource: if non-empty, limit to bans with source = filterSource
+//   - activeOnly: if true, only return bans with expires_at > now
+//   - page: 1-indexed page number
+//   - pageSize: records per page (caller should clamp to a reasonable max)
+func (d *DB) SearchBans(search, filterSource string, activeOnly bool, page, pageSize int) ([]Ban, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 25
+	}
+	offset := (page - 1) * pageSize
+
+	query, args := buildBanQuery(
+		`SELECT id, ip, dedupe_id, banned_at, expires_at, source`,
+		search, filterSource, activeOnly,
+		fmt.Sprintf(" ORDER BY banned_at DESC LIMIT %d OFFSET %d", pageSize, offset),
+	)
+	rows, err := d.conn.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanBans(rows)
+}
+
+// CountBans returns the total number of bans matching the given filters.
+// Use this alongside SearchBans to build pagination controls in the GUI.
+func (d *DB) CountBans(search, filterSource string, activeOnly bool) (int, error) {
+	query, args := buildBanQuery(`SELECT COUNT(1)`, search, filterSource, activeOnly, "")
+	var n int
+	err := d.conn.QueryRow(query, args...).Scan(&n)
+	return n, err
+}
+
+// buildBanQuery constructs the WHERE clause shared by SearchBans and CountBans.
+func buildBanQuery(selectClause, search, filterSource string, activeOnly bool, suffix string) (string, []any) {
+	q := selectClause + " FROM bans"
+	var conditions []string
+	var args []any
+
+	if search != "" {
+		conditions = append(conditions, "ip LIKE ?")
+		args = append(args, "%"+search+"%")
+	}
+	if filterSource != "" {
+		conditions = append(conditions, "source = ?")
+		args = append(args, filterSource)
+	}
+	if activeOnly {
+		conditions = append(conditions, "expires_at > ?")
+		args = append(args, time.Now().Unix())
+	}
+
+	if len(conditions) > 0 {
+		q += " WHERE " + joinConditions(conditions)
+	}
+	q += suffix
+	return q, args
+}
+
+// joinConditions joins SQL condition strings with " AND ".
+func joinConditions(conds []string) string {
+	result := ""
+	for i, c := range conds {
+		if i > 0 {
+			result += " AND "
+		}
+		result += c
+	}
+	return result
+}
+
 // AllDedupeIDs returns all dedupe IDs (active + expired) for seeding the in-memory set.
 func (d *DB) AllDedupeIDs() ([]string, error) {
 	rows, err := d.conn.Query(`SELECT dedupe_id FROM bans`)

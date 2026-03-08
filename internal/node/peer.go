@@ -27,6 +27,7 @@ type Peer struct {
 	key          []byte
 	manager      *Manager
 	conn         net.Conn
+	lastSeen     time.Time
 	mu           sync.Mutex
 	// outbound-only fields
 	tlsCert   string
@@ -68,6 +69,28 @@ func (p *Peer) setRemoteNodeID(id string) {
 	p.remoteNodeID = id
 }
 
+// IsConnected returns true if the peer currently has an active connection.
+func (p *Peer) IsConnected() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.conn != nil
+}
+
+// LastSeen returns the time the last valid frame was received from this peer.
+func (p *Peer) LastSeen() time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastSeen
+}
+
+// Direction returns "inbound" or "outbound".
+func (p *Peer) Direction() string {
+	if p.isInbound {
+		return "inbound"
+	}
+	return "outbound"
+}
+
 // Send encrypts and writes a framed message to the peer connection.
 func (p *Peer) Send(plaintext []byte) error {
 	p.mu.Lock()
@@ -105,6 +128,9 @@ func (p *Peer) readLoop() (wasError bool) {
 			p.conn.SetDeadline(time.Time{})
 			handshakeDone = true
 		}
+		p.mu.Lock()
+		p.lastSeen = time.Now()
+		p.mu.Unlock()
 		msg, err := proto.Decode(raw)
 		if err != nil {
 			logger.Warn("peer %s bad message: %v", p.remoteAddr, err)

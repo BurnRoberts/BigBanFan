@@ -76,7 +76,7 @@ func handleUnixConn(conn net.Conn, onBan BanFunc, onUnban UnbanFunc) {
 		// "!ip" prefix = unban request.
 		if strings.HasPrefix(line, "!") {
 			ip := strings.TrimSpace(line[1:])
-			if !isValidIP(ip) {
+			if !isValidIPOrCIDR(ip) {
 				logger.Warn("unix socket: invalid IP for unban %q — ignored", ip)
 				fmt.Fprintf(conn, "ERR: invalid IP %q\n", ip)
 				continue
@@ -91,7 +91,7 @@ func handleUnixConn(conn net.Conn, onBan BanFunc, onUnban UnbanFunc) {
 
 		// Plain IP = ban request.
 		ip := line
-		if !isValidIP(ip) {
+		if !isValidIPOrCIDR(ip) {
 			logger.Warn("unix socket: invalid IP %q — ignored", ip)
 			fmt.Fprintf(conn, "ERR: invalid IP %q\n", ip)
 			continue
@@ -146,14 +146,14 @@ func handleClientConn(conn net.Conn, key []byte, onBan BanFunc, onUnban UnbanFun
 
 	switch msg.Type {
 	case proto.MsgBan:
-		if !isValidIP(msg.IP) {
+		if !isValidIPOrCIDR(msg.IP) {
 			logger.Warn("client %s: invalid IP %q", conn.RemoteAddr(), msg.IP)
 			return
 		}
 		logger.Info("client %s BAN %s", conn.RemoteAddr(), msg.IP)
 		onBan(msg.IP)
 	case proto.MsgUnban:
-		if !isValidIP(msg.IP) {
+		if !isValidIPOrCIDR(msg.IP) {
 			logger.Warn("client %s: invalid IP for unban %q", conn.RemoteAddr(), msg.IP)
 			return
 		}
@@ -166,6 +166,12 @@ func handleClientConn(conn net.Conn, key []byte, onBan BanFunc, onUnban UnbanFun
 	}
 }
 
-func isValidIP(ip string) bool {
-	return net.ParseIP(ip) != nil
+// isValidIPOrCIDR returns true if s is a valid IPv4/IPv6 address OR a valid
+// CIDR range (e.g. "1.2.3.0/24" or "2001:db8::/32").
+func isValidIPOrCIDR(s string) bool {
+	if net.ParseIP(s) != nil {
+		return true
+	}
+	_, _, err := net.ParseCIDR(s)
+	return err == nil
 }
