@@ -21,6 +21,7 @@ type Detector struct {
 	hits      map[string][]time.Time // source IP → timestamps of failures
 	onBan     func(string)
 	stopCh    chan struct{}
+	stopOnce  sync.Once // guards against double-close of stopCh
 }
 
 // New creates a Detector. window is the sliding time window; threshold is the
@@ -65,19 +66,26 @@ func (d *Detector) RecordFailure(remote string) {
 
 	if count >= d.threshold {
 		logger.Warn("scan-detect: THRESHOLD REACHED for %s (%d failures in %s) — auto-banning", ip, count, d.window)
-		// Clear so we don't repeatedly trigger (the ban itself will block future connections).
+		// Delete and fire under lock so two simultaneous connections at the
+		// threshold can't both call onBan for the same IP.
 		d.mu.Lock()
-		delete(d.hits, ip)
-		d.mu.Unlock()
-		if d.onBan != nil {
-			d.onBan(ip)
+		// Re-check: another goroutine may have already fired and deleted.
+		if _, still := d.hits[ip]; still {
+			delete(d.hits, ip)
+			d.mu.Unlock()
+			if d.onBan != nil {
+				d.onBan(ip)
+			}
+		} else {
+			d.mu.Unlock()
 		}
 	}
 }
 
 // Stop shuts down the background cleanup goroutine.
+// Safe to call more than once — only the first call closes the channel.
 func (d *Detector) Stop() {
-	close(d.stopCh)
+	d.stopOnce.Do(func() { close(d.stopCh) })
 }
 
 // cleanupLoop periodically evicts source IPs whose last failure is older than

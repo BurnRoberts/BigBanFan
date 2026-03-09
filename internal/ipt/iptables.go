@@ -5,6 +5,8 @@ import (
 	"net"
 	"os/exec"
 	"strings"
+
+	"bigbanfan/internal/logger"
 )
 
 const chainName = "BANNED"
@@ -37,7 +39,7 @@ func Setup() error {
 	}
 	// ip6tables is best-effort: warn if missing, don't abort.
 	if err := setupFamily("ip6tables"); err != nil {
-		fmt.Printf("WARN: ip6tables setup skipped: %v\n", err)
+		logger.Warn("ip6tables setup skipped: %v", err)
 	}
 	return nil
 }
@@ -104,9 +106,17 @@ func AddBan(ip string) error {
 }
 
 // RemoveBan removes the DROP rule for ip from the correct BANNED chain.
+// Idempotent: if the rule does not exist (already removed or chain flushed),
+// the error is silently swallowed — goal state is achieved either way.
 func RemoveBan(ip string) error {
 	bin := cmd(ip)
 	if err := run(bin, "-D", chainName, "-s", cidr(ip), "-j", "DROP"); err != nil {
+		// iptables exits 1 with "Bad rule" when the rule simply doesn't exist.
+		// Treat that as success — the IP is already unblocked.
+		msg := err.Error()
+		if strings.Contains(msg, "Bad rule") || strings.Contains(msg, "does a matching rule exist") {
+			return nil
+		}
 		return fmt.Errorf("ipt: remove ban %s: %w", ip, err)
 	}
 	return nil
@@ -119,9 +129,7 @@ func chainExistsFamily(bin string) bool {
 
 // jumpExistsFamily checks whether the INPUT → BANNED jump exists for the given binary.
 func jumpExistsFamily(bin string) bool {
-	out, err := exec.Command(bin, "-C", "INPUT", "-j", chainName).CombinedOutput()
-	_ = out
-	return err == nil
+	return exec.Command(bin, "-C", "INPUT", "-j", chainName).Run() == nil
 }
 
 // cidr converts a bare IP to CIDR notation (/32 for IPv4, /128 for IPv6).

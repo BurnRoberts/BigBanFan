@@ -19,21 +19,23 @@ type Session struct {
 	key       []byte
 	mgr       MgrIface
 	db        *db.DB
-	logSub    bool   // true when client has subscribed to log lines
-	logLevel  string // "info", "warn", "error"
+	onFailure FailureFunc
+	logSub    bool
+	logLevel  string
 	pushCh    chan *proto.Message
 	closeOnce sync.Once
 	done      chan struct{}
 }
 
-func newSession(conn net.Conn, key []byte, mgr MgrIface, database *db.DB) *Session {
+func newSession(conn net.Conn, key []byte, mgr MgrIface, database *db.DB, onFailure FailureFunc) *Session {
 	return &Session{
-		conn:   conn,
-		key:    key,
-		mgr:    mgr,
-		db:     database,
-		pushCh: make(chan *proto.Message, 256),
-		done:   make(chan struct{}),
+		conn:      conn,
+		key:       key,
+		mgr:       mgr,
+		db:        database,
+		onFailure: onFailure,
+		pushCh:    make(chan *proto.Message, 256),
+		done:      make(chan struct{}),
 	}
 }
 
@@ -47,8 +49,7 @@ func (s *Session) Push(msg *proto.Message) {
 	}
 }
 
-// run is the main session goroutine. Spawns a push-writer goroutine and then
-// blocks reading request frames from the client.
+// run is the main session goroutine.
 func (s *Session) run() {
 	go s.pushWriter()
 	defer s.close()
@@ -59,11 +60,17 @@ func (s *Session) run() {
 	decFn := func(b []byte) ([]byte, error) { return crypto.Decrypt(s.key, b) }
 	verFn := func(data, sig []byte) bool { return crypto.Verify(s.key, data, sig) }
 
+	handshakeDone := false
 	for {
 		raw, err := proto.ReadFrame(s.conn, decFn, verFn)
 		if err != nil {
-			return // client disconnected or error
+			if !handshakeDone && s.onFailure != nil {
+				// Auth failure on first frame — count as a scan-detect hit.
+				s.onFailure(s.conn.RemoteAddr().String())
+			}
+			return
 		}
+		handshakeDone = true
 		msg, err := proto.Decode(raw)
 		if err != nil {
 			logger.Warn("mgmt: bad message from %s: %v", s.conn.RemoteAddr(), err)
@@ -134,7 +141,7 @@ func (s *Session) handleRequest(msg *proto.Message) {
 			return
 		}
 		logger.Info("mgmt: BAN %s (client=%s)", msg.IP, s.conn.RemoteAddr())
-		s.mgr.SubmitBan(msg.IP)
+		s.mgr.SubmitBanWithReason(msg.IP, msg.Reason)
 
 	case proto.MsgUnban:
 		if msg.IP == "" {
@@ -176,6 +183,7 @@ func (s *Session) handleRequest(msg *proto.Message) {
 				BannedAt:  b.BannedAt.Unix(),
 				ExpiresAt: b.ExpiresAt.Unix(),
 				Source:    b.Source,
+				Reason:    b.Reason,
 			}
 		}
 
@@ -229,6 +237,15 @@ func (s *Session) handleRequest(msg *proto.Message) {
 		s.logSub = false
 		logger.Info("mgmt: %s unsubscribed from log stream", s.conn.RemoteAddr())
 
+	case proto.MsgGetLogs:
+		// Return the last 100 buffered log lines in chronological order.
+		lines := logger.GetRecentLines()
+		s.send(&proto.Message{
+			Type:     proto.MsgLogsReply,
+			LogLines: lines,
+			Ts:       time.Now().Unix(),
+		})
+
 	default:
 		logger.Warn("mgmt: unknown request type %q from %s", msg.Type, s.conn.RemoteAddr())
 		s.sendError(fmt.Sprintf("unknown request type: %s", msg.Type))
@@ -247,7 +264,7 @@ func (s *Session) PushLogLine(level, line string) {
 	}
 	s.Push(&proto.Message{
 		Type: proto.MsgLogLine,
-		Line: fmt.Sprintf("[%s] %s", level, line),
+		Line: line,
 		Ts:   time.Now().Unix(),
 	})
 }

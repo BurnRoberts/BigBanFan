@@ -39,9 +39,8 @@ DNS_LOG_FILE = "/var/log/syslog"
 IGNORE_RANGES = [
     "127.0.0.0/8",           # loopback
     "::1/128",               # IPv6 loopback
-    "69.30.224.154/30",      # k8bunny-control
-    "107.150.36.26/29",      # cdn12
-    "69.197.188.186/29",     # cdn13
+    # "192.0.2.0/24",        # node1 — replace with your real node IPs
+    # "198.51.100.0/24",     # node2
     "192.168.0.0/16",        # Kubernetes pod subnet
     "10.96.0.0/16",          # Kubernetes service subnet
 ]

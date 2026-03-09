@@ -14,12 +14,6 @@ const (
 	// MsgUnban notifies peers to lift an existing ban on an IP/CIDR.
 	MsgUnban MsgType = "UNBAN"
 
-	// MsgDedupeCheck asks a peer whether they have already seen a dedupe ID.
-	MsgDedupeCheck MsgType = "DEDUPE_CHECK"
-
-	// MsgDedupeAck is the reply to MsgDedupeCheck.
-	MsgDedupeAck MsgType = "DEDUPE_ACK"
-
 	// MsgHeartbeat is a keep-alive probe.
 	MsgHeartbeat MsgType = "HEARTBEAT"
 
@@ -42,6 +36,9 @@ const (
 
 	// MsgLogUnsubscribe stops the log stream.
 	MsgLogUnsubscribe MsgType = "LOG_UNSUBSCRIBE"
+
+	// MsgGetLogs requests the last N buffered log lines from the node.
+	MsgGetLogs MsgType = "GET_LOGS"
 
 	// ── Management port — responses / push (node → GUI) ───────────────────────
 
@@ -72,6 +69,17 @@ const (
 	// MsgLogLine is pushed when log_subscribe is active.
 	MsgLogLine MsgType = "LOG_LINE"
 
+	// MsgLogsReply is the response to MsgGetLogs — contains the buffered log lines.
+	MsgLogsReply MsgType = "LOGS_REPLY"
+
+	// MsgSyncRequest is sent by a newly-connected outbound peer to request the
+	// full active ban list from its peer. Used on startup and after isolation.
+	MsgSyncRequest MsgType = "SYNC_REQUEST"
+
+	// MsgSyncReply is the response to MsgSyncRequest — contains all active bans.
+	// Reuses the Bans []BanRecord field on Message.
+	MsgSyncReply MsgType = "SYNC_REPLY"
+
 	// MsgError is returned when the node cannot fulfil a management request.
 	MsgError MsgType = "ERROR"
 )
@@ -94,6 +102,10 @@ type Message struct {
 
 	// DedupeID is the globally-unique identifier for this ban event (UUIDv4).
 	DedupeID string `json:"dedupe_id,omitempty"`
+
+	// Reason is an optional human-readable description of why the IP was banned.
+	// Max 1024 characters. Propagated to all peers and stored in the database.
+	Reason string `json:"reason,omitempty"`
 
 	// Known is set in DEDUPE_ACK replies: true means the recipient already
 	// has this event in its seen-set.
@@ -142,6 +154,9 @@ type Message struct {
 	// Line is a single log line (LOG_LINE push).
 	Line string `json:"line,omitempty"`
 
+	// LogLines is the slice of buffered log lines returned by LOGS_REPLY.
+	LogLines []string `json:"log_lines,omitempty"`
+
 	// ErrorMsg is a human-readable error description (ERROR messages).
 	ErrorMsg string `json:"error,omitempty"`
 }
@@ -154,6 +169,7 @@ type BanRecord struct {
 	BannedAt  int64  `json:"banned_at"`
 	ExpiresAt int64  `json:"expires_at"`
 	Source    string `json:"source"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 // PeerRecord describes a single peer node and its current connection state.

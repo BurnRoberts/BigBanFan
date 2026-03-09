@@ -11,7 +11,7 @@ LOG_DIR     = /var/log
 # ── Version ───────────────────────────────────────────────────
 # Bump this to tag a new release. Injected into the binary via ldflags.
 # Check deployed version: bigbanfan -version
-VERSION    = 0.1.2
+VERSION    = 0.1.3
 
 GO         = go
 LDFLAGS    = -ldflags="-s -w -X main.version=$(VERSION)"

@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 )
@@ -23,6 +25,7 @@ type Ban struct {
 	BannedAt  time.Time
 	ExpiresAt time.Time
 	Source    string // originating node_id
+	Reason    string // optional human-readable ban reason (max 1024 chars)
 }
 
 // Open opens (or creates) the SQLite database at path, running schema migrations.
@@ -52,22 +55,32 @@ func (d *DB) migrate() error {
 		dedupe_id  TEXT    NOT NULL UNIQUE,
 		banned_at  INTEGER NOT NULL,
 		expires_at INTEGER NOT NULL,
-		source     TEXT    NOT NULL
+		source     TEXT    NOT NULL,
+		reason     TEXT    NOT NULL DEFAULT ''
 	);
 	CREATE INDEX IF NOT EXISTS idx_bans_expires ON bans(expires_at);
 	CREATE INDEX IF NOT EXISTS idx_bans_ip ON bans(ip);`)
 	if err != nil {
 		return fmt.Errorf("db: migrate: %w", err)
 	}
+	// Additive migration: add reason column to existing databases that pre-date this field.
+	// ALTER TABLE ADD COLUMN is a no-op-safe operation in SQLite when the column already exists
+	// via CREATE TABLE above, but for truly old DBs this ensures the column is present.
+	_, _ = d.conn.Exec(`ALTER TABLE bans ADD COLUMN reason TEXT NOT NULL DEFAULT ''`)
 	return nil
 }
 
-// Insert persists a new ban entry.  Returns an error if the dedupe_id already exists.
-func (d *DB) Insert(ip, dedupeID, source string, bannedAt, expiresAt time.Time) error {
+// Insert persists a new ban entry. Returns an error if the dedupe_id already exists.
+// reason is capped at 1024 runes here as a safety net — the manager layer also
+// enforces this, but peer-relayed bans bypass that path.
+func (d *DB) Insert(ip, dedupeID, source, reason string, bannedAt, expiresAt time.Time) error {
+	if utf8.RuneCountInString(reason) > 1024 {
+		reason = string([]rune(reason)[:1024])
+	}
 	_, err := d.conn.Exec(
-		`INSERT OR IGNORE INTO bans(ip, dedupe_id, banned_at, expires_at, source)
-		 VALUES (?, ?, ?, ?, ?)`,
-		ip, dedupeID, bannedAt.Unix(), expiresAt.Unix(), source,
+		`INSERT OR IGNORE INTO bans(ip, dedupe_id, banned_at, expires_at, source, reason)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		ip, dedupeID, bannedAt.Unix(), expiresAt.Unix(), source, reason,
 	)
 	return err
 }
@@ -93,7 +106,7 @@ func (d *DB) IsActiveBan(ip string) (bool, error) {
 func (d *DB) GetActive() ([]Ban, error) {
 	now := time.Now().Unix()
 	rows, err := d.conn.Query(
-		`SELECT id, ip, dedupe_id, banned_at, expires_at, source
+		`SELECT id, ip, dedupe_id, banned_at, expires_at, source, reason
 		 FROM bans WHERE expires_at > ?`, now)
 	if err != nil {
 		return nil, err
@@ -106,7 +119,7 @@ func (d *DB) GetActive() ([]Ban, error) {
 func (d *DB) GetExpired() ([]Ban, error) {
 	now := time.Now().Unix()
 	rows, err := d.conn.Query(
-		`SELECT id, ip, dedupe_id, banned_at, expires_at, source
+		`SELECT id, ip, dedupe_id, banned_at, expires_at, source, reason
 		 FROM bans WHERE expires_at <= ?`, now)
 	if err != nil {
 		return nil, err
@@ -146,7 +159,7 @@ func (d *DB) SearchBans(search, filterSource string, activeOnly bool, page, page
 	offset := (page - 1) * pageSize
 
 	query, args := buildBanQuery(
-		`SELECT id, ip, dedupe_id, banned_at, expires_at, source`,
+		`SELECT id, ip, dedupe_id, banned_at, expires_at, source, reason`,
 		search, filterSource, activeOnly,
 		fmt.Sprintf(" ORDER BY banned_at DESC LIMIT %d OFFSET %d", pageSize, offset),
 	)
@@ -195,19 +208,20 @@ func buildBanQuery(selectClause, search, filterSource string, activeOnly bool, s
 
 // joinConditions joins SQL condition strings with " AND ".
 func joinConditions(conds []string) string {
-	result := ""
-	for i, c := range conds {
-		if i > 0 {
-			result += " AND "
-		}
-		result += c
-	}
-	return result
+	return strings.Join(conds, " AND ")
 }
 
-// AllDedupeIDs returns all dedupe IDs (active + expired) for seeding the in-memory set.
+// AllDedupeIDs returns dedupe IDs for all *active* (unexpired) bans.
+// These are seeded into the in-memory dedupe set on startup to prevent
+// re-broadcasting bans that survived a daemon restart.
+//
+// Expired rows are not included: they will be removed at the next FlushExpired
+// tick and their dedupe IDs are irrelevant for loop prevention.
+// Loading only active rows prevents startup OOM on databases with large
+// historical ban records.
 func (d *DB) AllDedupeIDs() ([]string, error) {
-	rows, err := d.conn.Query(`SELECT dedupe_id FROM bans`)
+	rows, err := d.conn.Query(
+		`SELECT dedupe_id FROM bans WHERE expires_at > ?`, time.Now().Unix())
 	if err != nil {
 		return nil, err
 	}
@@ -228,7 +242,7 @@ func scanBans(rows *sql.Rows) ([]Ban, error) {
 	for rows.Next() {
 		var b Ban
 		var bannedTS, expiresTS int64
-		if err := rows.Scan(&b.ID, &b.IP, &b.DedupeID, &bannedTS, &expiresTS, &b.Source); err != nil {
+		if err := rows.Scan(&b.ID, &b.IP, &b.DedupeID, &bannedTS, &expiresTS, &b.Source, &b.Reason); err != nil {
 			return nil, err
 		}
 		b.BannedAt = time.Unix(bannedTS, 0)

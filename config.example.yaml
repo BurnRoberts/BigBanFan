@@ -25,15 +25,21 @@ listen_port: 7777
 
 # TCP port for external clients (Python / PHP scripts).
 # Uses a SEPARATE key (client_key) from the inter-node key.
+# Set to 0 or omit to disable this port entirely.
 client_port: 7778
 
 # TCP port for the management GUI (bigbanfan-gui) and monitoring tools.
 # Uses the same client_key as client_port for auth.
 # Persistent bidirectional connections: supports request/response + push events.
+# Set to 0 or omit to disable this port entirely.
 mgmt_port: 7779
 
 # Unix domain socket for local root-only IP injection.
-# Usage: echo "1.2.3.4" | nc -U /run/bigbanfan.sock
+# Protocol: one entry per line:
+#   1.2.3.4                   → ban
+#   1.2.3.4|reason text       → ban with reason (propagated to all nodes)
+#   !1.2.3.4                  → unban
+# Set to "" or omit to disable the socket entirely.
 unix_socket: /run/bigbanfan.sock
 
 # ── Security Keys ─────────────────────────────────────────────
@@ -82,3 +88,28 @@ ignore_ranges:
   - "::1/128" # IPv6 loopback
   # - "192.168.0.0/16"     # Kubernetes pod subnet
   # - "10.96.0.0/16"       # Kubernetes service subnet
+
+# ── Allow Ranges ──────────────────────────────────────────────
+# Per-port IP source allowlists. Only connections from IPs in the
+# configured ranges are accepted; all others are closed immediately
+# (before TLS handshake / HMAC auth).
+#
+# Default for all three: ["0.0.0.0/0", "::/0"] — open to the world.
+# Restrict these to harden your deployment, e.g. only allow your
+# own datacentre IPs.
+#
+# peer_allow_ranges — restricts who may connect to listen_port (inter-node).
+# peer_allow_ranges:
+#   - "192.0.2.0/24"      # node1 subnet (replace with your real node IPs)
+#   - "198.51.100.0/24"   # node2 subnet
+#   - "203.0.113.0/24"    # node3 subnet
+
+# client_allow_ranges — restricts who may connect to client_port.
+# client_allow_ranges:
+#   - "127.0.0.0/8"       # local only
+#   - "192.168.1.0/24"    # admin VLAN
+
+# mgmt_allow_ranges — restricts who may connect to mgmt_port (GUI / tools).
+# mgmt_allow_ranges:
+#   - "192.168.1.0/24"    # admin VLAN
+#   - "10.0.0.0/8"        # internal network

@@ -13,10 +13,11 @@ type entry struct {
 // Set is a thread-safe in-memory store of dedupe IDs we have already
 // processed.  IDs older than ttl are evicted periodically to bound memory.
 type Set struct {
-	mu     sync.RWMutex
-	seen   map[string]entry
-	ttl    time.Duration
-	stopCh chan struct{}
+	mu       sync.RWMutex
+	seen     map[string]entry
+	ttl      time.Duration
+	stopCh   chan struct{}
+	stopOnce sync.Once // guards against double-close of stopCh
 }
 
 // New creates a Set that evicts entries older than ttl.
@@ -59,8 +60,9 @@ func (s *Set) Seed(ids []string) {
 }
 
 // Stop halts the background eviction goroutine.
+// Safe to call more than once — only the first call closes the channel.
 func (s *Set) Stop() {
-	close(s.stopCh)
+	s.stopOnce.Do(func() { close(s.stopCh) })
 }
 
 func (s *Set) cleanupLoop(interval time.Duration) {

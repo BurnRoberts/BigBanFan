@@ -165,6 +165,46 @@ func (p *Peer) handleMessage(msg *proto.Message) {
 		logger.Info("BAN received from %s: %s (dedupe=%s)", msg.NodeID, msg.IP, msg.DedupeID)
 		p.manager.HandleIncoming(msg)
 
+	case proto.MsgUnban:
+		if msg.IP == "" {
+			logger.Warn("peer %s sent incomplete UNBAN", p.remoteAddr)
+			return
+		}
+		logger.Info("UNBAN received from %s: %s", msg.NodeID, msg.IP)
+		p.manager.HandleIncoming(msg)
+
+	case proto.MsgSyncRequest:
+		// Peer is asking for our full active ban list.
+		// Any peer can respond — this does not consume the sync flag.
+		bans, err := p.manager.GetActiveBans()
+		if err != nil {
+			logger.Warn("sync: GetActiveBans for %s: %v", p.remoteAddr, err)
+			return
+		}
+		reply := &proto.Message{
+			Type: proto.MsgSyncReply,
+			Bans: bans,
+			Ts:   time.Now().Unix(),
+		}
+		data, _ := json.Marshal(reply)
+		if err := p.Send(data); err != nil {
+			logger.Warn("sync: send SYNC_REPLY to %s: %v", p.remoteAddr, err)
+		} else {
+			logger.Info("sync: sent SYNC_REPLY to %s (%d bans)", p.remoteAddr, len(bans))
+		}
+
+	case proto.MsgSyncReply:
+		// Only the outbound (initiating) side should receive SYNC_REPLY.
+		// An inbound peer receiving this is unexpected — ignore to prevent
+		// an authenticated rogue node from injecting bans via this path.
+		if p.isInbound {
+			logger.Warn("peer %s sent unsolicited SYNC_REPLY to inbound connection — ignoring", p.remoteAddr)
+			return
+		}
+		// Received the ban list from our sync peer — apply it locally.
+		logger.Info("sync: received SYNC_REPLY from %s (%d bans)", p.remoteAddr, len(msg.Bans))
+		p.manager.ApplySyncedBans(msg.Bans)
+
 	default:
 		logger.Warn("peer %s unknown msg type: %s", p.remoteAddr, msg.Type)
 	}
@@ -194,6 +234,10 @@ func (p *Peer) reconnectLoop() {
 		// Send initial heartbeat so peer learns our node_id.
 		p.sendHeartbeat()
 
+		// If we haven't synced yet (or need to re-sync after isolation),
+		// request the full active ban list from this peer.
+		p.maybeSendSyncRequest()
+
 		logger.Info("peer connected: %s", p.remoteAddr)
 		p.readLoop()
 
@@ -213,15 +257,24 @@ func (p *Peer) reconnectLoop() {
 		}
 
 		now = time.Now()
+		var sleepDur time.Duration
 		if now.Before(fastDeadline) {
 			logger.Warn("peer %s unreachable, retrying in %s (fast phase)", p.remoteAddr, reconnectFastInterval)
-			time.Sleep(reconnectFastInterval)
+			sleepDur = reconnectFastInterval
 		} else if now.Before(slowDeadline) {
 			logger.Warn("peer %s unreachable, retrying in %s (slow phase)", p.remoteAddr, reconnectSlowInterval)
-			time.Sleep(reconnectSlowInterval)
+			sleepDur = reconnectSlowInterval
 		} else {
 			logger.Error("peer %s has FAILED — node unreachable after 5 hours of retries", p.remoteAddr)
 			return
+		}
+		// Use a select so Shutdown() can interrupt the sleep immediately
+		// instead of waiting up to 30 minutes for the slow-phase interval.
+		select {
+		case <-p.manager.stopCh:
+			logger.Info("peer %s reconnect loop: shutdown signal received", p.remoteAddr)
+			return
+		case <-time.After(sleepDur):
 		}
 	}
 }
@@ -248,6 +301,26 @@ func (p *Peer) sendHeartbeat() {
 	data, _ := json.Marshal(msg)
 	if err := p.Send(data); err != nil {
 		logger.Warn("heartbeat to %s: %v", p.remoteAddr, err)
+	}
+}
+
+// maybeSendSyncRequest sends a SYNC_REQUEST to this peer if the manager's
+// sync flag has not yet been claimed. Only outbound peers call this.
+// TryClaimSync is a CAS — only one goroutine wins even if peers connect simultaneously.
+func (p *Peer) maybeSendSyncRequest() {
+	if !p.manager.TryClaimSync() {
+		return // another peer already claimed (or claimed and reset) the sync
+	}
+	logger.Info("sync: requesting ban list from %s", p.remoteAddr)
+	msg := &proto.Message{
+		Type: proto.MsgSyncRequest,
+		Ts:   time.Now().Unix(),
+	}
+	data, _ := json.Marshal(msg)
+	if err := p.Send(data); err != nil {
+		logger.Warn("sync: send SYNC_REQUEST to %s: %v", p.remoteAddr, err)
+		// Release the claim so the next peer can try.
+		p.manager.initialSyncDone.Store(false)
 	}
 }
 

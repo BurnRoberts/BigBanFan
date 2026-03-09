@@ -8,6 +8,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// allowAll is the default allow-ranges value: permit all IPv4 and IPv6.
+var allowAll = []string{"0.0.0.0/0", "::/0"}
+
 // Config holds all BigBanFan configuration.
 type Config struct {
 	// NodeID is a stable, unique identifier for this node (e.g. "cdn12").
@@ -25,11 +28,12 @@ type Config struct {
 	ListenPort int `yaml:"listen_port"`
 
 	// ClientPort is the TCP port for external client injection (Python/PHP scripts).
+	// Set to 0 or omit to disable this port entirely.
 	ClientPort int `yaml:"client_port"`
 
 	// MgmtPort is the TCP port for the persistent management connection (GUI / monitoring).
-	// Uses the same AES-256-GCM frame protocol as client_port but keeps connections
-	// alive and supports bidirectional request/response + push events.
+	// Uses the same AES-256-GCM frame protocol as client_port.
+	// Set to 0 or omit to disable this port entirely.
 	MgmtPort int `yaml:"mgmt_port"`
 
 	// UnixSocket is the path to the Unix domain socket for local IP injection.
@@ -60,33 +64,43 @@ type Config struct {
 	BanDurationHours float64 `yaml:"ban_duration_hours"`
 
 	// ScanDetect controls automatic banning of port scanners and probers.
-	// Any inbound connection that fails before completing a valid handshake
-	// (TLS error, bad cipher, EOF) increments a per-IP failure counter.
-	// When the counter hits Threshold within WindowSecs seconds, the IP is
-	// automatically submitted for banning across the cluster.
 	ScanDetectEnabled    bool `yaml:"scan_detect_enabled"`
 	ScanDetectThreshold  int  `yaml:"scan_detect_threshold"`
 	ScanDetectWindowSecs int  `yaml:"scan_detect_window_secs"`
 
 	// IgnoreRanges is a list of CIDR ranges that will NEVER be banned.
-	// Any IP (or range) submitted via socket, TCP client, or peer broadcast
-	// that falls within one of these ranges is silently dropped.
-	// Example: your own node IPs, Kubernetes pod/service subnets, management IPs.
 	IgnoreRanges []string `yaml:"ignore_ranges"`
 
 	// ParsedIgnoreRanges is populated from IgnoreRanges during Validate().
-	// Use this for runtime checks — not the raw string slice.
 	ParsedIgnoreRanges []*net.IPNet `yaml:"-"`
+
+	// PeerAllowRanges restricts which source IPs may connect to the inter-node
+	// listen_port. Default: ["0.0.0.0/0", "::/0"] (all addresses allowed).
+	PeerAllowRanges []string `yaml:"peer_allow_ranges"`
+
+	// ClientAllowRanges restricts which source IPs may connect to client_port.
+	// Default: ["0.0.0.0/0", "::/0"] (all addresses allowed).
+	ClientAllowRanges []string `yaml:"client_allow_ranges"`
+
+	// MgmtAllowRanges restricts which source IPs may connect to mgmt_port.
+	// Default: ["0.0.0.0/0", "::/0"] (all addresses allowed).
+	MgmtAllowRanges []string `yaml:"mgmt_allow_ranges"`
+
+	// Parsed allow-range nets (populated by Validate).
+	ParsedPeerAllowRanges   []*net.IPNet `yaml:"-"`
+	ParsedClientAllowRanges []*net.IPNet `yaml:"-"`
+	ParsedMgmtAllowRanges   []*net.IPNet `yaml:"-"`
 }
 
 // DefaultConfig returns a Config filled with sensible defaults.
+// ClientPort and MgmtPort default to 0 (disabled) — set them explicitly to enable.
 func DefaultConfig() *Config {
 	return &Config{
 		NodeID:               "node01",
 		MaxPeers:             8,
 		ListenPort:           7777,
-		ClientPort:           7778,
-		MgmtPort:             7779,
+		ClientPort:           0, // disabled unless configured
+		MgmtPort:             0, // disabled unless configured
 		UnixSocket:           "/run/bigbanfan.sock",
 		DBPath:               "/var/lib/bigbanfan/bans.db",
 		LogFile:              "/var/log/bigbanfan.log",
@@ -95,6 +109,9 @@ func DefaultConfig() *Config {
 		ScanDetectEnabled:    true,
 		ScanDetectThreshold:  5,
 		ScanDetectWindowSecs: 60,
+		PeerAllowRanges:      append([]string{}, allowAll...),
+		ClientAllowRanges:    append([]string{}, allowAll...),
+		MgmtAllowRanges:      append([]string{}, allowAll...),
 	}
 }
 
@@ -109,7 +126,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {
-		return nil, fmt.Errorf("parsing config file: %w", err)
+		return nil, fmt.Errorf("parsing config file: %w\n\nHint: check YAML indentation and quoting", err)
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -120,16 +137,13 @@ func Load(path string) (*Config, error) {
 }
 
 // Validate returns an error if required fields are missing or invalid.
-// It also parses IgnoreRanges into ParsedIgnoreRanges.
+// It also parses IgnoreRanges and *AllowRanges into their Parsed* counterparts.
 func (c *Config) Validate() error {
 	if c.NodeID == "" {
 		return fmt.Errorf("config: node_id is required")
 	}
 	if c.NodeKey == "" {
 		return fmt.Errorf("config: node_key is required (32-byte hex)")
-	}
-	if c.ClientKey == "" {
-		return fmt.Errorf("config: client_key is required (32-byte hex)")
 	}
 	if c.TLSCert == "" {
 		return fmt.Errorf("config: tls_cert is required")
@@ -141,8 +155,15 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: ban_duration_hours must be > 0")
 	}
 
+	// client_key is only required when client_port or mgmt_port is enabled.
+	if (c.ClientPort > 0 || c.MgmtPort > 0) && c.ClientKey == "" {
+		return fmt.Errorf("config: client_key is required when client_port or mgmt_port is enabled")
+	}
+
 	// Parse and validate ignore_ranges CIDRs.
-	c.ParsedIgnoreRanges = c.ParsedIgnoreRanges[:0] // reset in case Validate called again
+	// [:0:0] resets both length and capacity so repeated Validate() calls
+	// don't share the backing array with a previous parse.
+	c.ParsedIgnoreRanges = c.ParsedIgnoreRanges[:0:0]
 	for _, cidr := range c.IgnoreRanges {
 		_, network, err := net.ParseCIDR(cidr)
 		if err != nil {
@@ -151,24 +172,87 @@ func (c *Config) Validate() error {
 		c.ParsedIgnoreRanges = append(c.ParsedIgnoreRanges, network)
 	}
 
+	// Parse allow_ranges for each port. Empty slice → fall back to allowAll.
+	var err error
+	if c.ParsedPeerAllowRanges, err = parseAllowRanges("peer_allow_ranges", c.PeerAllowRanges); err != nil {
+		return err
+	}
+	if c.ParsedClientAllowRanges, err = parseAllowRanges("client_allow_ranges", c.ClientAllowRanges); err != nil {
+		return err
+	}
+	if c.ParsedMgmtAllowRanges, err = parseAllowRanges("mgmt_allow_ranges", c.MgmtAllowRanges); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// parseAllowRanges parses a list of CIDR strings into *net.IPNet values.
+// An empty list is treated as "allow all" (0.0.0.0/0 + ::/0).
+func parseAllowRanges(field string, ranges []string) ([]*net.IPNet, error) {
+	if len(ranges) == 0 {
+		ranges = allowAll
+	}
+	var nets []*net.IPNet
+	for _, cidr := range ranges {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("config: %s: invalid CIDR %q: %w", field, cidr, err)
+		}
+		nets = append(nets, network)
+	}
+	return nets, nil
 }
 
 // IsIgnored returns true if ip falls within any of the configured ignore_ranges.
 func (c *Config) IsIgnored(ipStr string) bool {
-	// Strip any CIDR suffix for lookup.
+	return c.inRanges(ipStr, c.ParsedIgnoreRanges)
+}
+
+// IsPeerAllowed returns true if the source IP is permitted to connect to listen_port.
+func (c *Config) IsPeerAllowed(ipStr string) bool {
+	return c.inRanges(ipStr, c.ParsedPeerAllowRanges)
+}
+
+// IsClientAllowed returns true if the source IP is permitted to connect to client_port.
+func (c *Config) IsClientAllowed(ipStr string) bool {
+	return c.inRanges(ipStr, c.ParsedClientAllowRanges)
+}
+
+// IsMgmtAllowed returns true if the source IP is permitted to connect to mgmt_port.
+func (c *Config) IsMgmtAllowed(ipStr string) bool {
+	return c.inRanges(ipStr, c.ParsedMgmtAllowRanges)
+}
+
+// inRanges is the shared implementation for all range checks.
+func (c *Config) inRanges(ipStr string, ranges []*net.IPNet) bool {
+	// Strip any CIDR suffix or port suffix for lookup.
 	host := ipStr
 	for i, ch := range ipStr {
-		if ch == '/' {
+		if ch == '/' || ch == ':' {
+			// For IPv4:port (host:port), strip the port.
+			// Don't strip colons in bare IPv6 addresses.
+			if ch == ':' {
+				// Only strip if it looks like host:port (host has no other colons).
+				if net.ParseIP(ipStr) != nil {
+					break // bare IPv6, keep as-is
+				}
+			}
 			host = ipStr[:i]
 			break
 		}
 	}
 	ip := net.ParseIP(host)
 	if ip == nil {
+		// Try host:port split as fallback.
+		if h, _, err := net.SplitHostPort(ipStr); err == nil {
+			ip = net.ParseIP(h)
+		}
+	}
+	if ip == nil {
 		return false
 	}
-	for _, network := range c.ParsedIgnoreRanges {
+	for _, network := range ranges {
 		if network.Contains(ip) {
 			return true
 		}

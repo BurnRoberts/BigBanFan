@@ -2,9 +2,10 @@
 # bigban — Ban or unban an IP across the BigBanFan cluster.
 #
 # Usage:
-#   bigban <ip>          # ban
-#   bigban -u <ip>       # unban
-#   bigban --unban <ip>  # unban
+#   bigban <ip>                    # ban
+#   bigban <ip> "reason text"      # ban with reason (propagated cluster-wide)
+#   bigban -u <ip>                 # unban
+#   bigban --unban <ip>            # unban
 
 HOST="your-node.example.com"       # ← BigBanFan node hostname or IP
 PORT="7778"                        # ← client_port from config.yaml
@@ -36,6 +37,11 @@ if [[ "$1" == "-u" || "$1" == "--unban" ]]; then
 else
     [[ -z "$1" ]] && { echo "Usage: bigban <ip>  |  bigban -u <ip>"; exit 1; }
     IP="$(normalize_ip "$1")"
-    echo "BAN: $IP"
-    python3 "$SCRIPT_DIR/scripts/bigbanfan_client.py" "$HOST" "$PORT" "$KEY" "$IP"
+    REASON="${2:-}"   # optional second argument
+    echo "BAN: $IP${REASON:+ (reason: $REASON)}"
+    if [[ -n "$REASON" ]]; then
+        python3 "$SCRIPT_DIR/scripts/bigbanfan_client.py" "$HOST" "$PORT" "$KEY" "$IP" "$REASON"
+    else
+        python3 "$SCRIPT_DIR/scripts/bigbanfan_client.py" "$HOST" "$PORT" "$KEY" "$IP"
+    fi
 fi

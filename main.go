@@ -62,10 +62,16 @@ func main() {
 		logger.Error("parse node_key: %v", err)
 		os.Exit(1)
 	}
-	clientKey, err := crypto.ParseKey(cfg.ClientKey)
-	if err != nil {
-		logger.Error("parse client_key: %v", err)
-		os.Exit(1)
+	// client_key is only required when client_port or mgmt_port is enabled.
+	// config.Validate() enforces this; we guard here so an empty client_key
+	// string (disabled ports) doesn't cause crypto.ParseKey to error out.
+	var clientKey []byte
+	if cfg.ClientPort > 0 || cfg.MgmtPort > 0 {
+		clientKey, err = crypto.ParseKey(cfg.ClientKey)
+		if err != nil {
+			logger.Error("parse client_key: %v", err)
+			os.Exit(1)
+		}
 	}
 
 	// ── Open Database ─────────────────────────────────────────────────────────
@@ -82,7 +88,11 @@ func main() {
 	ds := dedupe.New(banTTL, 10*time.Minute)
 	defer ds.Stop()
 
-	// Seed dedupe set from DB (survive reboot).
+	// Seed dedupe set from DB — prevents the daemon from re-broadcasting bans
+	// it already processed before the last restart (mesh loop prevention).
+	// Note: seeded IDs get seenAt=now, so they expire from the in-memory set
+	// after banTTL. That is fine: the banPipeline's IsActiveBan DB check is
+	// the primary duplicate guard; dedupe is only the fast-path loop-breaker.
 	ids, err := database.AllDedupeIDs()
 	if err != nil {
 		logger.Warn("seed dedupe: %v", err)
@@ -122,16 +132,19 @@ func main() {
 	mgr := node.NewManager(cfg, nodeKey, database, ds, version)
 
 	// ── Scan Detection ────────────────────────────────────────────────────────
+	var detStop func() // called on shutdown to stop the scan-detect cleanup goroutine
 	if cfg.ScanDetectEnabled {
 		window := time.Duration(cfg.ScanDetectWindowSecs) * time.Second
 		detector := scandetect.New(cfg.ScanDetectThreshold, window, func(ip string) {
 			logger.Warn("scan-detect: auto-banning %s", ip)
-			mgr.SubmitBan(ip)
+			mgr.SubmitBanWithReason(ip, "Port scan detected: banned for getting a bit too handsy with my ports.")
 		})
 		mgr.SetDetector(detector)
+		detStop = detector.Stop
 		logger.Info("scan-detect: enabled (threshold=%d failures / %ds window)",
 			cfg.ScanDetectThreshold, cfg.ScanDetectWindowSecs)
 	} else {
+		detStop = func() {}
 		logger.Info("scan-detect: disabled")
 	}
 
@@ -149,26 +162,56 @@ func main() {
 	}
 
 	// ── Client Layer ──────────────────────────────────────────────────────────
-	banFn := func(ip string) { mgr.SubmitBan(ip) }
+	banFn := func(ip, reason string) { mgr.SubmitBanWithReason(ip, reason) }
 	unbanFn := func(ip string) { mgr.SubmitUnban(ip) }
 
-	if err := client.ServeUnixSocket(cfg.UnixSocket, banFn, unbanFn); err != nil {
-		logger.Error("unix socket: %v", err)
-		os.Exit(1)
+	// failFn feeds failed connections into scan-detect (auto-ban on threshold).
+	// Nil when scan-detect is disabled so both ports stay nil-safe.
+	var failFn client.FailureFunc
+	if cfg.ScanDetectEnabled && mgr.Detector() != nil {
+		det := mgr.Detector()
+		failFn = func(remoteAddr string) {
+			if !cfg.IsIgnored(remoteAddr) {
+				det.RecordFailure(remoteAddr)
+			}
+		}
 	}
 
-	if err := client.ServeClientTCP(cfg.ClientPort, clientKey, banFn, unbanFn); err != nil {
-		logger.Error("client tcp: %v", err)
-		os.Exit(1)
+	if cfg.UnixSocket != "" {
+		if err := client.ServeUnixSocket(cfg.UnixSocket, banFn, unbanFn); err != nil {
+			logger.Error("unix socket: %v", err)
+			os.Exit(1)
+		}
+	} else {
+		logger.Info("unix socket disabled (unix_socket not set)")
 	}
 
-	// ── Management Port ───────────────────────────────────────────────────────
-	mgmtServer := mgmt.New(mgr, database, clientKey)
-	if err := mgmtServer.Serve(cfg.MgmtPort); err != nil {
-		logger.Error("mgmt port: %v", err)
-		os.Exit(1)
+	// ── Client TCP Port (optional — disabled when client_port = 0) ────────────
+	if cfg.ClientPort > 0 {
+		if err := client.ServeClientTCP(
+			cfg.ClientPort, clientKey, cfg.TLSCert, cfg.TLSKey,
+			cfg.IsClientAllowed,
+			banFn, unbanFn, failFn,
+		); err != nil {
+			logger.Error("client tcp: %v", err)
+			os.Exit(1)
+		}
+	} else {
+		logger.Info("client port disabled (client_port = 0)")
 	}
-	logger.Info("mgmt port: listening on :%d (client_key auth, persistent connections)", cfg.MgmtPort)
+
+	// ── Management Port (optional — disabled when mgmt_port = 0) ────────────
+	if cfg.MgmtPort > 0 {
+		mgmtServer := mgmt.New(mgr, database, clientKey, cfg.TLSCert, cfg.TLSKey,
+			mgmt.FailureFunc(failFn), cfg.IsMgmtAllowed)
+		if err := mgmtServer.Serve(cfg.MgmtPort); err != nil {
+			logger.Error("mgmt port: %v", err)
+			os.Exit(1)
+		}
+		logger.Info("mgmt port: listening on :%d (client_key auth, persistent connections)", cfg.MgmtPort)
+	} else {
+		logger.Info("mgmt port disabled (mgmt_port = 0)")
+	}
 
 	// ── Expiry Ticker ─────────────────────────────────────────────────────────
 	ticker := time.NewTicker(60 * time.Second)
@@ -178,13 +221,38 @@ func main() {
 			mgr.FlushExpired()
 		}
 	}()
-	logger.Info("BigBanFan v%s running — node_id=%s listen=:%d client=:%d socket=%s peers=%d",
-		version, cfg.NodeID, cfg.ListenPort, cfg.ClientPort, cfg.UnixSocket, len(cfg.Peers))
+	clientInfo := "disabled"
+	if cfg.ClientPort > 0 {
+		clientInfo = fmt.Sprintf(":%d", cfg.ClientPort)
+	}
+	mgmtInfo := "disabled"
+	if cfg.MgmtPort > 0 {
+		mgmtInfo = fmt.Sprintf(":%d", cfg.MgmtPort)
+	}
+	logger.Info("BigBanFan v%s running — node_id=%s listen=:%d client=%s mgmt=%s socket=%s peers=%d",
+		version, cfg.NodeID, cfg.ListenPort, clientInfo, mgmtInfo, cfg.UnixSocket, len(cfg.Peers))
 
 	// ── Signal Handling ───────────────────────────────────────────────────────
+	// SIGTERM/SIGINT → graceful shutdown.
+	// SIGHUP         → reopen log file (logrotate support — no daemon restart needed).
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	sig := <-sigCh
-	logger.Info("received signal %s — shutting down", sig)
-	logger.Info("BigBanFan stopped")
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	for {
+		sig := <-sigCh
+		switch sig {
+		case syscall.SIGHUP:
+			logger.Info("received SIGHUP — reopening log file")
+			if err := logger.Reopen(); err != nil {
+				logger.Warn("log reopen failed: %v", err)
+			} else {
+				logger.Info("log file reopened successfully")
+			}
+		default:
+			logger.Info("received signal %s — shutting down", sig)
+			mgr.Shutdown() // unblocks reconnect goroutines sleeping in select
+			detStop()
+			logger.Info("BigBanFan stopped")
+			return
+		}
+	}
 }

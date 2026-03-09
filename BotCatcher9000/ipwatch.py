@@ -15,6 +15,7 @@ Log line format (any of these work):
 
 import ipaddress
 import os
+import re
 import subprocess
 import threading
 import time
@@ -87,7 +88,6 @@ def normalize(raw: str) -> str | None:
     if ip.lower().startswith("::ffff:"):
         ip = ip[7:]
         # Strip trailing :port from IPv4 (e.g. 1.2.3.4:56789).
-        import re
         m = re.match(r'^(\d+\.\d+\.\d+\.\d+):\d+$', ip)
         if m:
             ip = m.group(1)

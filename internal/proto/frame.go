@@ -45,8 +45,12 @@ func ReadFrame(r io.Reader, decryptFn func([]byte) ([]byte, error), verifyFn fun
 	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
 		return nil, fmt.Errorf("frame read: length prefix: %w", err)
 	}
-	if length > 64*1024*1024 { // 64 MB sanity cap
-		return nil, fmt.Errorf("frame read: excessive length %d", length)
+	// 4 MB hard cap: enough for a SYNC_REPLY with tens of thousands of bans.
+	// The original 64 MB cap allowed a single malicious peer to force a 64 MB
+	// heap allocation per connection — a trivial OOM DoS vector.
+	const maxFrameSize = 4 * 1024 * 1024 // 4 MB
+	if length > maxFrameSize {
+		return nil, fmt.Errorf("frame read: frame too large (%d bytes, max %d)", length, maxFrameSize)
 	}
 	payload := make([]byte, length)
 	if _, err := io.ReadFull(r, payload); err != nil {

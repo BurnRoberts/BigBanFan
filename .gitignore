@@ -1,4 +1,4 @@
-# ── Build output ──────────────────────────────────────────────
+MEMORY.md
 bin/
 *.exe
 
@@ -40,4 +40,8 @@ Thumbs.db
 .agent/
 deprecated/
 MARKETING.md
+GEMINI.md
 reload.sh
+update_servers.sh
+upload.sh
+MGMT_API.md
